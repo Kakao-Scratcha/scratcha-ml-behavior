@@ -1,0 +1,70 @@
+# --------------------
+# OS / 환경별 공통
+# --------------------
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo
+
+# --------------------
+# Python (백엔드/ML)
+# --------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.npy
+*.npz
+*.pth
+*.onnx
+
+# 가상환경
+.venv/
+env/
+venv/
+
+# 빌드 / 배포 산출물
+dist/
+build/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# 캐시 / 데이터
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+logs/
+checkpoints/
+outputs/
+data/processed/
+data/interim/
+data/raw/
+
+# --------------------
+# Node.js (프론트엔드/Vite)
+# --------------------
+node_modules/
+dist/
+build/
+.cache/
+*.tsbuildinfo
+
+# --------------------
+# IDE / 툴
+# --------------------
+.vscode/
+.idea/
+*.iml
+
+# --------------------
+# 기타
+# --------------------
+.env
+!.env.example
+*.gz
+*.zip
+*.tar
