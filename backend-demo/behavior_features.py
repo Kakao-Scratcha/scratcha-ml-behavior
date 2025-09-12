@@ -1,10 +1,11 @@
 # behavior_features.py
-# 전처리 전담 모듈 (canvas 기준 OOB를 강제)
+# 모델 입력 윈도우 7채널: [x, y, vx, vy, speed, accel, oob_canvas]
+# 학습 파이프라인(build_dataset.py)과 **동일한** 시간 스케일/미분 규칙 적용
 
 from typing import Any, List, Optional, Tuple
 import numpy as np
 
-# ---------- ROI 유틸 ----------
+# ---------- ROI ----------
 def _to_rect(d):
     try:
         L, T, W, H = float(d["left"]), float(d["top"]), float(d["w"]), float(d["h"])
@@ -14,32 +15,24 @@ def _to_rect(d):
     except Exception:
         return None
 
-def _roi_rects(meta: Any) -> Tuple[Optional[Tuple[float,float,float,float]], Optional[Tuple[float,float,float,float]]]:
-    """
-    rect_track:  정규화 및 모델 입력 OOB(=canvas 기준)   -> 폴백 금지
-    rect_oob:    통계용 wrapper 기준 (없으면 None)
-    """
+def _roi_rects(meta: Any):
     rmap = (getattr(meta, "roi_map", None) or {})
     rect_canvas = _to_rect(rmap.get("canvas-container")) if rmap.get("canvas-container") else None
     rect_wrap   = _to_rect(rmap.get("scratcha-container")) if rmap.get("scratcha-container") else None
-    # 🔒 canvas 기준을 강제: canvas가 없으면 track 없음으로 간주
-    rect_track = rect_canvas
-    rect_oob   = rect_wrap
-    return rect_track, rect_oob
+    return rect_canvas, rect_wrap
 
 # ---------- 이벤트 평탄화 ----------
 def _flatten_events(meta: Any, events: List[Any]):
     out = []
     for ev in events:
-        et = getattr(ev, "type", None)
+        et = getattr(ev, "type", None) or (ev.get("type") if isinstance(ev, dict) else None)
         if et in ("moves", "moves_free"):
-            p = getattr(ev, "payload", None)
-            if not p:
-                continue
-            base = int(getattr(p, "base_t", 0) or 0)
-            dts  = list(getattr(p, "dts", []) or [])
-            xs   = list(getattr(p, "xrs", []) or [])
-            ys   = list(getattr(p, "yrs", []) or [])
+            p = getattr(ev, "payload", None) or (ev.get("payload") if isinstance(ev, dict) else None)
+            if not p: continue
+            base = int(getattr(p, "base_t", 0) or (p.get("base_t") if isinstance(p, dict) else 0) or 0)
+            dts  = list(getattr(p, "dts", []) or (p.get("dts") if isinstance(p, dict) else []) or [])
+            xs   = list(getattr(p, "xrs", []) or (p.get("xrs") if isinstance(p, dict) else []) or [])
+            ys   = list(getattr(p, "yrs", []) or (p.get("yrs") if isinstance(p, dict) else []) or [])
             t = base
             n = min(len(dts), len(xs), len(ys))
             for i in range(n):
@@ -47,32 +40,43 @@ def _flatten_events(meta: Any, events: List[Any]):
                 dt = int(dts[i]) if int(dts[i]) > 0 else 1
                 t += dt
         elif et in ("pointerdown", "pointerup", "click"):
-            t  = getattr(ev, "t", None)
-            xr = getattr(ev, "x_raw", None)
-            yr = getattr(ev, "y_raw", None)
-            if t is None or xr is None or yr is None:
-                continue
+            t  = (getattr(ev, "t", None) if not isinstance(ev, dict) else ev.get("t"))
+            xr = (getattr(ev, "x_raw", None) if not isinstance(ev, dict) else ev.get("x_raw"))
+            yr = (getattr(ev, "y_raw", None) if not isinstance(ev, dict) else ev.get("y_raw"))
+            if t is None or xr is None or yr is None: continue
             out.append((int(t), float(xr), float(yr)))
     out.sort(key=lambda x: x[0])
     return out
 
-# ---------- 시간 단위 보정 (sec/ms/us → ms) ----------
-def _fix_time_units_to_ms(ts_ms_like: np.ndarray) -> np.ndarray:
-    ts = np.asarray(ts_ms_like, dtype=np.float64)
-    if ts.size < 2:
-        return ts
-    diffs = np.diff(ts)
-    diffs = diffs[diffs > 0]
-    if diffs.size == 0:
-        return ts
-    med = float(np.median(diffs))
-    if med <= 0.01:     # 초 단위로 보임 → ms로 승격
-        return ts * 1000.0
-    if med >= 1000.0:   # us 단위로 보임 → ms로 강등
-        return ts / 1000.0
-    return ts
+# ---------- 시간 스케일 보정 (학습 규칙과 동일) ----------
+def _time_scale_to_ms(t: np.ndarray) -> Tuple[np.ndarray, str]:
+    """
+    규칙 (build_dataset.py와 동일):
+    - 이미 ms: rng>=1000ms 또는 med_dt>=5ms → 그대로
+    - 초 단위: 0.2<=med_dt<=5.0 and rng<=600 → *1000
+    - 프레임 인덱스(60/30Hz): 0.8<=med_dt<=1.2 → *16  (보수적 16ms)
+    - 범위가 너무 작음(rng<100ms): 인덱스 재생성 → idx*16
+    - 그 외: ms로 간주 (fallback)
+    """
+    if t.size < 2:
+        return t, "time_ok_len1"
+    t = t.astype(np.float64)
+    rng = float(t[-1] - t[0])
+    dt = np.diff(t)
+    med_dt = float(np.median(dt)) if dt.size else 0.0
 
-def _norm_xy(x_raw: float, y_raw: float, rect: Tuple[float,float,float,float]):
+    if rng >= 1000.0 or med_dt >= 5.0:
+        return t, "time_ms"
+    if 0.2 <= med_dt <= 5.0 and rng <= 600.0:
+        return t * 1000.0, "time_seconds_scaled_ms"
+    if 0.8 <= med_dt <= 1.2:
+        return t * 16.0, "time_frames_scaled_ms"
+    if rng < 100.0:
+        idx = np.arange(len(t), dtype=np.float64)
+        return idx * 16.0, "time_reindexed_16ms"
+    return t, "time_ms_fallback"
+
+def _norm_xy(x_raw: float, y_raw: float, rect):
     L, T, W, H = rect
     xr = (x_raw - L) / max(1.0, W)
     yr = (y_raw - T) / max(1.0, H)
@@ -81,82 +85,77 @@ def _norm_xy(x_raw: float, y_raw: float, rect: Tuple[float,float,float,float]):
     y = min(1.0, max(0.0, yr))
     return x, y, oob
 
-# ---------- 특징 구성 (dt 기반, 모델 입력 oob=canvas 기준) ----------
+# ---------- 특징 구성 (학습과 동일한 미분/하한) ----------
 def build_window_7ch(meta: Any, events: List[Any], T: int = 300):
     """
     반환: (X, raw_len, has_track, has_wrap, oob_canvas_rate, oob_wrapper_rate)
-      - X: (T,7) float32, 채널=[x,y,vx,vy,speed,accel,oob_canvas]
+    X: (T,7), 채널=[x, y, vx, vy, speed, accel, oob_canvas]
     """
-    rect_track, rect_oob = _roi_rects(meta)
+    rect_track, rect_wrap = _roi_rects(meta)
+    has_wrap = rect_wrap is not None
     if rect_track is None:
-        # 🔒 canvas가 없으면 모델 입력을 만들지 않음(폴백 금지)
-        return None, 0, False, (rect_oob is not None), 0.0, 0.0
+        return None, 0, False, has_wrap, 0.0, 0.0
 
     pts = _flatten_events(meta, events)
     if not pts:
-        return None, 0, True, (rect_oob is not None), 0.0, 0.0
+        return None, 0, True, has_wrap, 0.0, 0.0
 
-    # 1) 정규화 + OOB (canvas 기준)
-    xs, ys, oobs_canvas, oobs_wrap, ts = [], [], [], [], []
+    xs, ys, oob_c, oob_w, ts = [], [], [], [], []
     for t, xr, yr in pts:
-        x1, y1, oob_canvas = _norm_xy(xr, yr, rect_track)  # ← 항상 canvas 기준
-        xs.append(x1); ys.append(y1); oobs_canvas.append(oob_canvas); ts.append(float(t))
-
-        if rect_oob is not None:
-            _, _, oob_wrap = _norm_xy(xr, yr, rect_oob)    # 통계용 wrapper
+        x1, y1, oc = _norm_xy(xr, yr, rect_track)          # 입력/oob는 **항상 canvas 기준**
+        xs.append(x1); ys.append(y1); oob_c.append(oc); ts.append(float(t))
+        if rect_wrap is not None:
+            _, _, ow = _norm_xy(xr, yr, rect_wrap)
         else:
-            oob_wrap = 0  # wrapper가 없으면 0으로
-        oobs_wrap.append(oob_wrap)
+            ow = 0
+        oob_w.append(ow)
 
     xs = np.asarray(xs, dtype=np.float32)
     ys = np.asarray(ys, dtype=np.float32)
-    oobs_canvas = np.asarray(oobs_canvas, dtype=np.float32)
-    oobs_wrap   = np.asarray(oobs_wrap, dtype=np.float32)
-    ts = _fix_time_units_to_ms(np.asarray(ts, dtype=np.float64))  # 2) 시간 보정(ms)
+    oob_c = np.asarray(oob_c, dtype=np.float32)
+    oob_w = np.asarray(oob_w, dtype=np.float32)
 
-    # 3) dt (sec)
-    dt_ms = np.diff(ts, prepend=ts[0])
-    dt_ms = np.clip(dt_ms, 1e-3, None)
-    dt_s  = dt_ms / 1000.0
+    # 시간 스케일 보정 → ms
+    ts = np.asarray(ts, dtype=np.float64)
+    ts, _ = _time_scale_to_ms(ts)
 
-    # 4) vx, vy, speed, accel
-    if len(xs) < 2:
+    # === 학습과 동일한 미분/하한 ===
+    # dt_s 하한 = 1e-6 sec (0.001 ms)
+    if len(ts) < 2:
         vx = np.zeros_like(xs); vy = np.zeros_like(ys)
-        speed = np.zeros_like(xs); accel = np.zeros_like(xs)
+        speed = np.zeros_like(xs); acc = np.zeros_like(xs)
     else:
+        dt = np.diff(ts, prepend=ts[0]) / 1000.0
+        dt[dt <= 1e-6] = 1e-6
         dx = np.diff(xs, prepend=xs[0]); dy = np.diff(ys, prepend=ys[0])
-        vx = dx / dt_s; vy = dy / dt_s
-        speed  = np.sqrt(vx*vx + vy*vy)
-        accel  = np.diff(speed, prepend=speed[0]) / dt_s
+        vx = dx / dt; vy = dy / dt
+        speed = np.sqrt(vx * vx + vy * vy)
+        acc = np.diff(speed, prepend=speed[0]) / dt
 
-    # 5) 모델 입력: [x, y, vx, vy, speed, accel, oob_canvas]
-    X = np.stack([xs, ys, vx, vy, speed, accel, oobs_canvas], axis=1).astype(np.float32)
+    # ⚠️ 어떤 추가적 클리핑/스케일링도 하지 않음 — 학습 분포와 동일 유지
+    X = np.stack([xs, ys, vx, vy, speed, acc, oob_c], axis=1).astype(np.float32)
     raw_len = X.shape[0]
 
-    # 6) 길이 정규화
+    # 길이 정규화
     if raw_len < T:
         X = np.concatenate([X, np.zeros((T - raw_len, X.shape[1]), np.float32)], axis=0)
     elif raw_len > T:
         X = X[-T:, :]
 
-    # 7) 통계
-    oob_canvas_rate  = float(np.mean(oobs_canvas > 0.5)) if oobs_canvas.size else 0.0
-    oob_wrapper_rate = float(np.mean(oobs_wrap   > 0.5)) if oobs_wrap.size   else 0.0
-    return X, raw_len, True, (rect_oob is not None), oob_canvas_rate, oob_wrapper_rate
+    oob_canvas_rate  = float(np.mean(oob_c > 0.5)) if oob_c.size else 0.0
+    oob_wrapper_rate = float(np.mean(oob_w > 0.5)) if oob_w.size else 0.0
+    return X, raw_len, True, has_wrap, oob_canvas_rate, oob_wrapper_rate
 
-def seq_stats(X, raw_len: int, has_track: bool, has_wrap: bool, oob_canvas_rate: float, oob_wrap_rate: float):
+def seq_stats(X, raw_len, has_track, has_wrap, oob_canvas_rate, oob_wrapper_rate):
     if X is None or X.size == 0:
         return {
-            "oob_rate_canvas": 0.0,
-            "oob_rate_wrapper": 0.0,
-            "speed_mean": 0.0,
-            "n_events": 0,
-            "roi_has_canvas": has_track,
-            "roi_has_wrapper": has_wrap,
+            "oob_rate_canvas": 0.0, "oob_rate_wrapper": 0.0,
+            "speed_mean": 0.0, "n_events": 0,
+            "roi_has_canvas": has_track, "roi_has_wrapper": has_wrap,
         }
     return {
         "oob_rate_canvas": float(oob_canvas_rate),
-        "oob_rate_wrapper": float(oob_wrap_rate),
+        "oob_rate_wrapper": float(oob_wrapper_rate),
         "speed_mean": float(np.mean(X[:, 4])),
         "n_events": int(raw_len),
         "roi_has_canvas": has_track,

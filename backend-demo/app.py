@@ -177,7 +177,7 @@ def upload_ks3_session(payload: CollectRequest, session_id: str):
         return (None, None, f"upload error: {e}")
 
 # ====== FastAPI ======
-app = FastAPI(title="Scratcha Collector + Inline Verify", version="3.4.0")
+app = FastAPI(title="Scratcha Collector + Inline Verify", version="3.4.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS or ["*"],
@@ -216,6 +216,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ART_DIR  = (BASE_DIR / ".." / "artifacts" / "cnn").resolve()
 BEST_PT  = ART_DIR / "best.pt"
 THR_JSON = ART_DIR / "thresholds.json"
+CALIB_JSON = ART_DIR / "calibration.json"
 
 _MODEL: Optional[nn.Module] = None
 _THRESHOLD: Optional[float] = None
@@ -257,10 +258,45 @@ def get_model() -> Optional[nn.Module]:
             _MODEL = None
         return _MODEL
 
-# ====== Temperature scaling (fit_temperature 결과를 운영에 적용) ======
-LOGIT_TEMPERATURE = float(getenv_any(["LOGIT_TEMPERATURE"], "2.0"))
+# ====== Calibration (temperature / platt) ======
+_CALIB = None
+_CALIB_MTIME = None
 
-# ====== 전처리: 외부 모듈(behavior_features) 사용 ======
+def _load_calibration():
+    """
+    calibration.json mtime을 보고 자동 리로드.
+    지원: {"type":"temperature","T":...}  |  {"type":"platt","a":...,"b":...}
+    """
+    global _CALIB, _CALIB_MTIME
+    try:
+        st = CALIB_JSON.stat()
+        if _CALIB is not None and _CALIB_MTIME == st.st_mtime:
+            return _CALIB  # 캐시 유효
+        with open(CALIB_JSON, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        t = str(obj.get("type", "")).lower()
+        if t == "temperature":
+            _CALIB = ("temperature", float(obj["T"]))
+        elif t == "platt":
+            _CALIB = ("platt", float(obj["a"]), float(obj["b"]))
+        else:
+            _CALIB = None
+        _CALIB_MTIME = st.st_mtime
+    except Exception:
+        _CALIB = None
+        _CALIB_MTIME = None
+    return _CALIB
+
+@app.post("/reload_calibration")
+async def reload_calibration():
+    """수동 리로드 엔드포인트(운영 중 교체 시 사용)"""
+    global _CALIB, _CALIB_MTIME
+    _CALIB = None
+    _CALIB_MTIME = None
+    cal = _load_calibration()
+    return {"ok": True, "loaded": (cal is not None)}
+
+# ====== 전처리: 외부 모듈 ======
 from behavior_features import build_window_7ch, seq_stats
 
 def run_inference(meta: SessionMeta, events: List[EventItem]):
@@ -268,20 +304,31 @@ def run_inference(meta: SessionMeta, events: List[EventItem]):
     if model is None:
         return {"ok": False, "error": "model not loaded"}
 
-    # (전처리) canvas 기준 OOB만 모델 입력으로 사용 (behavior_features에서 강제)
+    # (전처리) canvas 기준 OOB만 모델 입력으로 사용
     X, raw_len, has_track, has_wrap, oob_c, oob_w = build_window_7ch(meta, events, T=300)
     if X is None:
         return {"ok": False, "error": "empty or invalid events/roi"}
 
-    # (추론)
+    # (추론: 원시 logit)
     xt = torch.from_numpy(np.transpose(X, (1,0))).unsqueeze(0).float()  # (1,7,300)
     with torch.no_grad():
         logit = model(xt).item()
 
-    # (후처리) Temperature scaling: prob = sigmoid(logit / T)
-    T = max(1e-6, LOGIT_TEMPERATURE)
-    z = logit / T
-    prob = float(1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0))))
+    # (후처리) Calibration 우선순위: temperature → platt
+    calib = _load_calibration()
+    if calib and calib[0] == "temperature":
+        T = max(1.0, float(calib[1]))   # ← 안전: 최소 1.0로 고정
+        z = logit / T
+    elif calib and calib[0] == "platt":
+        a, b = float(calib[1]), float(calib[2])
+        z = a * logit + b
+    else:
+        T = 2.0  # 기본 Temperature
+        z = logit / T
+
+    z_raw = float(z)
+    z_clip = float(np.clip(z_raw, -3.0, 3.0))  # 시그모이드 전 클립
+    prob = float(1.0 / (1.0 + np.exp(-z_clip)))
 
     thr = float(get_threshold())
     verdict = "bot" if prob >= thr else "human"
@@ -292,6 +339,7 @@ def run_inference(meta: SessionMeta, events: List[EventItem]):
         "threshold": thr,
         "verdict": verdict,
         "stats": seq_stats(X, raw_len, has_track, has_wrap, oob_c, oob_w),
+        "debug": {"logit": float(logit), "calib": calib, "z_raw": z_raw, "z_clip": z_clip},
     }
 
 # ====== Endpoints ======
@@ -363,12 +411,14 @@ async def collect_finalize(payload: CollectRequest):
 
 @app.get("/healthz")
 async def healthz():
+    cal = _load_calibration()  # 강제 로드하여 상태 반영
     return {
         "ok": True,
         "env": ENV_NAME,
-        "model_loaded": (get_model() is not None),  # 동일 진입점 사용
+        "model_loaded": (get_model() is not None),
         "thr": get_threshold(),
-        "temp": LOGIT_TEMPERATURE,
+        "calibration_json": str(CALIB_JSON),
+        "calib": cal,
         "best_pt": str(BEST_PT),
     }
 

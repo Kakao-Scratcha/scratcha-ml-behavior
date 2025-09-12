@@ -27,10 +27,9 @@ function App() {
         verification.verdict === 'bot'   ? '봇'   :
         String(verification.verdict || '알수없음')
 
-      const probPct = typeof verification.bot_prob === 'number'
-        ? (verification.bot_prob * 100).toFixed(1) : 'N/A'
+      const probRaw = verification.bot_prob
+      const probPct = typeof probRaw === 'number' ? (probRaw * 100).toFixed(1) : 'N/A'
       const thr = verification.threshold != null ? verification.threshold : 'N/A'
-
       const stats = verification?.stats || {}
       const speedMean = (stats?.speed_mean != null) ? stats.speed_mean.toFixed(4) : 'N/A'
       const oobCanvas = (typeof stats.oob_rate_canvas === 'number') ? stats.oob_rate_canvas : null
@@ -39,9 +38,11 @@ function App() {
       console.group('[Scratcha verification]')
       console.log(`판정결과: ${verdictKo}`)
       console.log(`봇일 확률: ${probPct}%`)
+      console.log('봇일 확률(원시값):', probRaw)   // ← 반올림 BEFORE 값을 직접 확인
       console.log(`임계치: ${thr}`)
       console.log(`속도(평균): ${speedMean}`)
       console.log(`OOB비율(canvas): ${oobPct}%`)
+      console.log('Debug info:', verification?.debug)
       console.groupEnd()
     } catch (e) {
       console.error('verification log error:', e)
